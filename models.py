@@ -54,6 +54,7 @@ class Order(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
     funpay_order_id = Column(String(64), unique=True, nullable=False, index=True)
     buyer_input = Column(Text, nullable=True)  # ник/ссылка от покупателя
+    full_desc = Column(Text, nullable=True)  # подробное описание с FunPay (содержит id: XXXXX)
     status = Column(SAEnum(FunPayOrderStatus), nullable=False, default=FunPayOrderStatus.PAID)
     subcategory = Column(String(256), nullable=True)
     short_desc = Column(Text, nullable=True)

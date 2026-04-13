@@ -152,10 +152,20 @@ async def _handle_new_order(
     if existing:
         return
 
-    # Найти автоматизацию по subcategory_name
-    automation = _find_automation(db, user_id, order_shortcut.description)
+    # Получаем полный ордер чтобы достать full_description (там хранится id: XXXXX)
+    try:
+        full_order = account.get_order(funpay_order_id)
+        full_desc = full_order.full_description or ""
+    except Exception as e:
+        logger.error(f"[{user_id}] Не удалось получить полный ордер {funpay_order_id}: {e}")
+        return
+
+    logger.debug(f"[{user_id}] full_description: {repr(full_desc)}")
+
+    # Найти автоматизацию по id: из подробного описания
+    automation = _find_automation(db, user_id, full_desc)
     if not automation:
-        logger.info(f"[{user_id}] Нет активной автоматизации для '{order_shortcut.subcategory_name}', игнор")
+        logger.info(f"[{user_id}] Нет активной автоматизации для ордера {funpay_order_id}, игнор")
         return
 
     # Проверить quantity
@@ -175,6 +185,7 @@ async def _handle_new_order(
         quantity=quantity,
         buyer_id=order_shortcut.buyer_id,
         buyer_username=order_shortcut.buyer_username,
+        full_desc=full_desc,
     )
     db.add(order)
     db.flush()
@@ -269,7 +280,7 @@ async def _start_smm_order(
     loop: asyncio.AbstractEventLoop,
 ):
     # Найти хэш-запись (lot → smm_service)
-    automation = _find_automation(db, user_id, order.short_desc or '')
+    automation = _find_automation(db, user_id, order.full_desc or '')
     if not automation:
         _send(account, chat_id, "❌ Ошибка конфигурации автоматизации. Свяжитесь с продавцом.")
         service.status = ServiceStatus.FAILED
