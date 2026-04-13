@@ -396,18 +396,27 @@ def _send(account: Account, chat_id: int, text: str):
 
 
 def _find_automation(db: Session, user_id: str, subcategory_name: str) -> CurrentUserService | None:
-    """Ищет активную автоматизацию для данного юзера и подкатегории."""
-    return (
+    """
+    Ищет активную автоматизацию для данного юзера и подкатегории.
+    FunPay в ордере добавляет название игры перед подкатегорией:
+    лот хранит 'Услуги', ордер приносит 'Telegram, Услуги' — матчим через contains.
+    """
+    automations = (
         db.query(CurrentUserService)
         .join(Lot, Lot.lot_id == CurrentUserService.lot_id)
         .filter(
             CurrentUserService.user_id == user_id,
             CurrentUserService.is_active == True,
-            Lot.subcategory == subcategory_name,
+            Lot.subcategory.isnot(None),
         )
-        .first()
+        .all()
     )
-
+    for automation in automations:
+        if automation.lot and automation.lot.subcategory:
+            lot_sub = automation.lot.subcategory.strip()
+            if lot_sub in subcategory_name or subcategory_name in lot_sub:
+                return automation
+    return None
 
 def _get_active_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
     """
