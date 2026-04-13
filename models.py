@@ -55,6 +55,7 @@ class Order(Base):
     funpay_order_id = Column(String(64), unique=True, nullable=False, index=True)
     buyer_input = Column(Text, nullable=True)  # ник/ссылка от покупателя
     full_desc = Column(Text, nullable=True)  # подробное описание с FunPay (содержит id: XXXXX)
+    chat_node = Column(Integer, nullable=True)  # FunPay chat node ID для send_message
     status = Column(SAEnum(FunPayOrderStatus), nullable=False, default=FunPayOrderStatus.PAID)
     subcategory = Column(String(256), nullable=True)
     short_desc = Column(Text, nullable=True)

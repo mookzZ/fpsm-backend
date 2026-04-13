@@ -198,10 +198,19 @@ async def _handle_new_order(
     db.add(service)
     db.commit()
 
-    # Написать покупателю
-    _send(account, order_shortcut.buyer_id,
+    # Найти chat node по username покупателя из сохранённых чатов runner'а
+    chat_node = _find_chat_node(account, order_shortcut.buyer_username)
+    if chat_node is None:
+        logger.error(f"[{user_id}] Не найден chat node для {order_shortcut.buyer_username}, не можем написать")
+        return
+
+    # Сохраняем chat_node в order для дальнейших сообщений
+    order.chat_node = chat_node
+    db.commit()
+
+    _send(account, chat_node,
           "Привет! Заказ оплачен ✅\nОтправьте ссылку или ник для выполнения:")
-    logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, ждём инпут от {order_shortcut.buyer_username}")
+    logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
 async def _handle_new_message(
@@ -217,9 +226,9 @@ async def _handle_new_message(
     if msg.by_bot or msg.author_id == account.id:
         return
 
-    text = (msg.text or "").strip()
+    text = (msg.text or "").strip()  # может быть пустым если сообщение — картинка/ссылка
     buyer_id = msg.author_id
-    chat_id = msg.chat_id
+    chat_id = msg.chat_id  # node ID — используем напрямую из события
 
     # Найти активный заказ этого покупателя
     order = _get_active_order(db, user_id, buyer_id)
@@ -230,13 +239,16 @@ async def _handle_new_message(
     if not service:
         return
 
+    # Используем сохранённый chat_node если есть, иначе fallback на chat_id из события
+    effective_chat_id = order.chat_node or chat_id
+
     # ── /retry ───────────────────────────────────────────────────────────────
     if text == "/retry":
         if service.status in (ServiceStatus.PENDING_INPUT, ServiceStatus.AWAITING_CONFIRM):
             service.status = ServiceStatus.PENDING_INPUT
             order.buyer_input = None
             db.commit()
-            _send(account, chat_id, "Хорошо, отправьте новую ссылку/ник:")
+            _send(account, effective_chat_id, "Хорошо, отправьте новую ссылку/ник:")
         return
 
     # ── pending_input: ждём ссылку/ник ───────────────────────────────────────
@@ -246,7 +258,7 @@ async def _handle_new_message(
         order.buyer_input = text
         service.status = ServiceStatus.AWAITING_CONFIRM
         db.commit()
-        _send(account, chat_id,
+        _send(account, effective_chat_id,
               f"Ваша ссылка/ник:\n{text}\n\n"
               f"Перепроверьте и подтвердите:\n/yes — продолжить\n/no — отмена\n/retry — изменить")
         return
@@ -258,13 +270,13 @@ async def _handle_new_message(
         elif text == "/no":
             service.status = ServiceStatus.FAILED
             db.commit()
-            _send(account, chat_id, "Заказ отменён.")
+            _send(account, effective_chat_id, "Заказ отменён.")
         return
 
     # ── processing: /status ───────────────────────────────────────────────────
     if service.status == ServiceStatus.PROCESSING:
         if text == "/status":
-            _send(account, chat_id, "⏳ Заказ в работе, ожидайте...")
+            _send(account, effective_chat_id, "⏳ Заказ в работе, ожидайте...")
         return
 
 
@@ -404,6 +416,18 @@ def _send(account: Account, chat_id: int, text: str):
         account.send_message(chat_id, text)
     except Exception as e:
         logger.error(f"send_message failed: {e}")
+
+
+def _find_chat_node(account: Account, buyer_username: str) -> int | None:
+    """Ищет chat node по username покупателя в сохранённых чатах Runner'а."""
+    try:
+        saved = account._Account__saved_chats  # dict {node_id: ChatShortcut}
+        for node_id, chat in saved.items():
+            if chat.name == buyer_username:
+                return node_id
+    except Exception as e:
+        logger.error(f"_find_chat_node error: {e}")
+    return None
 
 
 def _find_automation(db: Session, user_id: str, order_description: str) -> CurrentUserService | None:
