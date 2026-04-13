@@ -140,6 +140,7 @@ async def _handle_new_order(
 ):
     order_shortcut = event.order
 
+    logger.debug(f"[{user_id}] NewOrderEvent: id={order_shortcut.id} status={order_shortcut.status} subcategory='{order_shortcut.subcategory_name}' desc='{order_shortcut.description}' amount={order_shortcut.amount} buyer={order_shortcut.buyer_username}")
     # Реагируем ТОЛЬКО на оплаченные заказы
     if order_shortcut.status != OrderStatuses.PAID:
         return
