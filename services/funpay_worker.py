@@ -153,7 +153,7 @@ async def _handle_new_order(
         return
 
     # Найти автоматизацию по subcategory_name
-    automation = _find_automation(db, user_id, order_shortcut.subcategory_name)
+    automation = _find_automation(db, user_id, order_shortcut.description)
     if not automation:
         logger.info(f"[{user_id}] Нет активной автоматизации для '{order_shortcut.subcategory_name}', игнор")
         return
@@ -269,7 +269,7 @@ async def _start_smm_order(
     loop: asyncio.AbstractEventLoop,
 ):
     # Найти хэш-запись (lot → smm_service)
-    automation = _find_automation(db, user_id, order.subcategory)
+    automation = _find_automation(db, user_id, order.short_desc or '')
     if not automation:
         _send(account, chat_id, "❌ Ошибка конфигурации автоматизации. Свяжитесь с продавцом.")
         service.status = ServiceStatus.FAILED
@@ -395,28 +395,29 @@ def _send(account: Account, chat_id: int, text: str):
         logger.error(f"send_message failed: {e}")
 
 
-def _find_automation(db: Session, user_id: str, subcategory_name: str) -> CurrentUserService | None:
+def _find_automation(db: Session, user_id: str, order_description: str) -> CurrentUserService | None:
     """
-    Ищет активную автоматизацию для данного юзера и подкатегории.
-    FunPay в ордере добавляет название игры перед подкатегорией:
-    лот хранит 'Услуги', ордер приносит 'Telegram, Услуги' — матчим через contains.
+    Ищет автоматизацию по lot_id из описания ордера.
+    Продавец обязан добавить 'id: <funpay_lot_id>' в описание лота.
     """
-    automations = (
+    import re
+    match = re.search(r'id:\s*(\d+)', order_description, re.IGNORECASE)
+    if not match:
+        logger.warning(f"Не найден 'id: ...' в описании ордера: '{order_description}'")
+        return None
+
+    funpay_lot_id = match.group(1)
+
+    return (
         db.query(CurrentUserService)
         .join(Lot, Lot.lot_id == CurrentUserService.lot_id)
         .filter(
             CurrentUserService.user_id == user_id,
             CurrentUserService.is_active == True,
-            Lot.subcategory.isnot(None),
+            Lot.funpay_lot_id == funpay_lot_id,
         )
-        .all()
+        .first()
     )
-    for automation in automations:
-        if automation.lot and automation.lot.subcategory:
-            lot_sub = automation.lot.subcategory.strip()
-            if lot_sub in subcategory_name or subcategory_name in lot_sub:
-                return automation
-    return None
 
 def _get_active_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
     """

@@ -169,8 +169,15 @@ async def delete_automation(
     if not automation:
         raise HTTPException(status_code=404, detail="Автоматизация не найдена")
 
-    await db.execute(delete(LotServiceHash).where(LotServiceHash.lot_id == automation.lot_id))
+    lot_id = automation.lot_id
+    await db.execute(delete(LotServiceHash).where(LotServiceHash.lot_id == lot_id))
     await db.delete(automation)
+    await db.flush()
+    # Удаляем лот — он больше не нужен
+    lot_result = await db.execute(select(Lot).where(Lot.lot_id == lot_id))
+    lot = lot_result.scalar_one_or_none()
+    if lot:
+        await db.delete(lot)
     await db.commit()
     return {"ok": True}
 
