@@ -3,7 +3,7 @@ import httpx
 
 logger = logging.getLogger("smm")
 
-SMM_BASE = "https://smmway.ru/api/v2"
+SMM_BASE = "https://twiboost.com/api/v2"
 
 
 class SMMError(Exception):
