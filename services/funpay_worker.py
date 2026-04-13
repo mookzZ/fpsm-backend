@@ -22,6 +22,51 @@ try:
     from FunPayAPI.updater.runner import Runner
     from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
     from FunPayAPI.common.enums import OrderStatuses
+    import FunPayAPI.account as _fp_account
+    import re as _re
+
+    # Monkey-patch: FunPayAPI крашится на сообщениях без div.message-text
+    # (ссылки, картинки используют div.chat-msg-text)
+    _orig_parse = _fp_account.Account._Account__parse_messages.__wrapped__         if hasattr(_fp_account.Account._Account__parse_messages, '__wrapped__')         else _fp_account.Account._Account__parse_messages
+
+    def _patched_parse(self, messages_data, chat_id, interlocutor_id, interlocutor_name):
+        from bs4 import BeautifulSoup
+        result = []
+        for msg_data in messages_data:
+            try:
+                parser = BeautifulSoup(msg_data["html"], "html.parser")
+                msg_text_el = (
+                    parser.find("div", {"class": "message-text"}) or
+                    parser.find("div", {"class": "chat-msg-text"})
+                )
+                if msg_text_el is None:
+                    continue  # пропускаем нераспознанные сообщения
+                msg_data["html"] = msg_data["html"]  # оставляем как есть
+            except Exception:
+                pass
+        return _orig_parse(self, messages_data, chat_id, interlocutor_id, interlocutor_name)
+
+    # Патч применяем через замену в модуле
+    _orig_parse_messages = _fp_account.Account._Account__parse_messages
+
+    def _safe_parse_messages(self, messages_data, chat_id, interlocutor_id, interlocutor_name):
+        safe_messages = []
+        for msg in messages_data:
+            try:
+                from bs4 import BeautifulSoup
+                parser = BeautifulSoup(msg["html"], "html.parser")
+                has_text = (
+                    parser.find("div", {"class": "message-text"}) or
+                    parser.find("div", {"class": "chat-msg-text"})
+                )
+                if has_text:
+                    safe_messages.append(msg)
+            except Exception:
+                safe_messages.append(msg)
+        return _orig_parse_messages(self, safe_messages, chat_id, interlocutor_id, interlocutor_name)
+
+    _fp_account.Account._Account__parse_messages = _safe_parse_messages
+
 except ImportError:
     raise RuntimeError("FunPayAPI не установлен. pip install FunPayAPI")
 
