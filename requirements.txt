@@ -1,0 +1,12 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+sqlalchemy>=2.0.0
+asyncpg
+psycopg2-binary
+pydantic>=2.0.0
+pydantic-settings
+httpx
+FunPayAPI
+beautifulsoup4
+requests
+requests-toolbelt
