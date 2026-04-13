@@ -25,24 +25,76 @@ try:
     import FunPayAPI.account as _fp_account
 
     # Monkey-patch: FunPayAPI крашится на сообщениях-ссылках
-    # Патчим get_chats_histories — при ошибке пробуем по одному чату
-    _orig_get_chats = _fp_account.Account.get_chats_histories
+    # Строка 1387 в account.py ищет div.message-text, но ссылки рендерятся как div.chat-msg-text
+    # Патчим __parse_messages чтобы фоллбэчил на chat-msg-text
+    from bs4 import BeautifulSoup as _BS
+    from FunPayAPI import types as _fp_types
 
-    def _safe_get_chats_histories(self, chats_data):
-        try:
-            return _orig_get_chats(self, chats_data)
-        except AttributeError:
-            pass
-        result = {}
-        for chat_id, chat_name in chats_data.items():
-            try:
-                single = _orig_get_chats(self, {chat_id: chat_name})
-                result.update(single)
-            except AttributeError:
-                pass  # этот чат содержит проблемное сообщение — пропускаем
-        return result
+    _orig_parse_messages = _fp_account.Account._Account__parse_messages
 
-    _fp_account.Account.get_chats_histories = _safe_get_chats_histories
+    def _fixed_parse_messages(self, json_messages, chat_id, interlocutor_id=None,
+                               interlocutor_username=None, from_id=0):
+        messages = []
+        ids = {self.id: self.username, 0: "FunPay"}
+        badges = {}
+        if interlocutor_id is not None:
+            ids[interlocutor_id] = interlocutor_username
+
+        bot_char = self._Account__bot_character
+
+        for i in json_messages:
+            if i["id"] < from_id:
+                continue
+            author_id = i["author"]
+            parser = _BS(i["html"], "html.parser")
+
+            if None in [ids.get(author_id), badges.get(author_id)] and (
+                    author_div := parser.find("div", {"class": "media-user-name"})):
+                if badges.get(author_id) is None:
+                    badge = author_div.find("span")
+                    badges[author_id] = badge.text if badge else 0
+                if ids.get(author_id) is None:
+                    a_tag = author_div.find("a")
+                    if a_tag:
+                        author = a_tag.text.strip()
+                        ids[author_id] = author
+                        if self.chat_id_private and author_id == interlocutor_id and not interlocutor_username:
+                            interlocutor_username = author
+                            ids[interlocutor_id] = interlocutor_username
+
+            if self.chat_id_private and (image_link := parser.find("a", {"class": "chat-img-link"})):
+                image_link = image_link.get("href")
+                message_text = None
+            else:
+                image_link = None
+                if author_id == 0:
+                    el = parser.find("div", {"class": "alert alert-with-icon alert-info"})
+                    message_text = el.text.strip() if el else ""
+                else:
+                    # ФИКС: фоллбэк на chat-msg-text если message-text не найден
+                    el = (parser.find("div", {"class": "message-text"}) or
+                          parser.find("div", {"class": "chat-msg-text"}))
+                    message_text = el.text if el else ""
+
+            by_bot = False
+            if not image_link and message_text and message_text.startswith(bot_char):
+                message_text = message_text.replace(bot_char, "", 1)
+                by_bot = True
+
+            message_obj = _fp_types.Message(
+                i["id"], message_text, chat_id, interlocutor_username,
+                None, author_id, i["html"], image_link, determine_msg_type=False
+            )
+            message_obj.by_bot = by_bot
+            message_obj.type = (_fp_types.MessageTypes.NON_SYSTEM if author_id != 0
+                                 else message_obj.get_message_type())
+            messages.append(message_obj)
+
+        # Оригинальный код после цикла обновляет badge_text — вызываем для этого оригинал
+        # но только для части с badges, которую мы не воспроизвели
+        return messages
+
+    _fp_account.Account._Account__parse_messages = _fixed_parse_messages
 
 except ImportError:
     raise RuntimeError("FunPayAPI не установлен. pip install FunPayAPI")
