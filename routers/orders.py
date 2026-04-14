@@ -1,6 +1,7 @@
 """
 Orders router — просмотр заказов и сервисов.
 """
+import re
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,13 @@ from models import User, Order, Service
 from deps import get_current_user
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
+
+
+def _extract_lot_id(full_desc: str | None) -> str | None:
+    if not full_desc:
+        return None
+    m = re.search(r'id:\s*(\d+)', full_desc, re.IGNORECASE)
+    return m.group(1) if m else None
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -37,6 +45,7 @@ class OrderOut(BaseModel):
     quantity: int | None
     buyer_username: str | None
     buyer_input: str | None
+    lot_funpay_id: str | None
     service: ServiceOut | None
     created_at: str
 
@@ -71,6 +80,7 @@ async def get_orders(
             quantity=o.quantity,
             buyer_username=o.buyer_username,
             buyer_input=o.buyer_input,
+            lot_funpay_id=_extract_lot_id(o.full_desc),
             service=ServiceOut(
                 service_id=str(o.service.service_id),
                 smm_service_id=o.service.smm_service_id,
