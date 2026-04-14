@@ -184,7 +184,7 @@ def _worker_loop(user_id: str, stop_event: threading.Event):
             runner = Runner(account)
             logger.info(f"[{user_id}] Runner инициализирован как {account.username}")
 
-            for event in runner.listen(requests_delay=6.0):
+            for event in runner.listen(requests_delay=1.5):
                 if stop_event.is_set():
                     break
 
