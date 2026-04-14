@@ -1,11 +1,12 @@
 """
 FunPay Worker — запускается в отдельном потоке на каждого юзера.
 Слушает события FunPay через Runner.listen(), обрабатывает заказы и сообщения.
+Каждый handler диспатчится в ThreadPoolExecutor — независимая параллельная обработка заказов.
 """
 import logging
 import threading
 import asyncio
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
 
@@ -90,8 +91,6 @@ try:
                                  else message_obj.get_message_type())
             messages.append(message_obj)
 
-        # Оригинальный код после цикла обновляет badge_text — вызываем для этого оригинал
-        # но только для части с badges, которую мы не воспроизвели
         return messages
 
     _fp_account.Account._Account__parse_messages = _fixed_parse_messages
@@ -108,7 +107,7 @@ class WorkerManager:
     """Синглтон. Управляет потоками-воркерами для каждого юзера."""
 
     def __init__(self):
-        self._threads: dict[str, threading.Thread] = {}    # user_id str → Thread
+        self._threads: dict[str, threading.Thread] = {}
         self._stop_events: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
@@ -149,7 +148,6 @@ class WorkerManager:
                 User.smm_key.isnot(None),
             ).all()
             for u in users:
-                # Есть ли хоть одна активная автоматизация?
                 has_active = db.query(CurrentUserService).filter(
                     CurrentUserService.user_id == u.user_id,
                     CurrentUserService.is_active == True,
@@ -165,210 +163,206 @@ worker_manager = WorkerManager()
 
 def _worker_loop(user_id: str, stop_event: threading.Event):
     logger.info(f"[{user_id}] Worker loop started")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+
+    with SyncSessionLocal() as db:
+        user: User = db.query(User).filter(User.user_id == user_id).first()
+        if not user or not user.golden_key:
+            logger.error(f"[{user_id}] Нет golden_key, останавливаемся")
+            return
+        golden_key = user.golden_key
 
     try:
-        with SyncSessionLocal() as db:
-            user: User = db.query(User).filter(User.user_id == user_id).first()
-            if not user or not user.golden_key:
-                logger.error(f"[{user_id}] Нет golden_key, останавливаемся")
-                return
+        account = Account(golden_key).get()
+    except Exception as e:
+        logger.error(f"[{user_id}] Не удалось инициализировать аккаунт: {e}")
+        return
 
-            try:
-                account = Account(user.golden_key).get()
-            except Exception as e:
-                logger.error(f"[{user_id}] Не удалось инициализировать аккаунт: {e}")
-                return
+    # Один лок на все FunPay API calls этого юзера — защита от race condition
+    account_lock = threading.Lock()
+    runner = Runner(account)
+    logger.info(f"[{user_id}] Runner инициализирован как {account.username}")
 
-            runner = Runner(account)
-            logger.info(f"[{user_id}] Runner инициализирован как {account.username}")
-
+    try:
+        with ThreadPoolExecutor(max_workers=20, thread_name_prefix=f"fp-{user_id}") as executor:
             for event in runner.listen(requests_delay=1.5):
                 if stop_event.is_set():
                     break
-
                 try:
                     if isinstance(event, NewOrderEvent):
-                        loop.run_until_complete(_handle_new_order(event, user_id, account, db, loop))
+                        executor.submit(_handle_new_order, event, user_id, account, account_lock)
                     elif isinstance(event, NewMessageEvent):
-                        loop.run_until_complete(_handle_new_message(event, user_id, account, db, loop))
+                        executor.submit(_handle_new_message, event, user_id, account, account_lock)
                 except Exception as e:
-                    logger.error(f"[{user_id}] Ошибка обработки события: {e}", exc_info=True)
-
+                    logger.error(f"[{user_id}] Ошибка диспатча события: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"[{user_id}] Критическая ошибка воркера: {e}", exc_info=True)
     finally:
-        loop.close()
         logger.info(f"[{user_id}] Worker loop stopped")
 
 
 # ── Event Handlers ────────────────────────────────────────────────────────────
 
-async def _handle_new_order(
+def _handle_new_order(
     event: NewOrderEvent,
     user_id: str,
     account: Account,
-    db: Session,
-    loop: asyncio.AbstractEventLoop,
+    account_lock: threading.Lock,
 ):
     order_shortcut = event.order
 
     logger.debug(f"[{user_id}] NewOrderEvent: id={order_shortcut.id} status={order_shortcut.status} subcategory='{order_shortcut.subcategory_name}' desc='{order_shortcut.description}' amount={order_shortcut.amount} buyer={order_shortcut.buyer_username}")
-    # Реагируем ТОЛЬКО на оплаченные заказы
+
     if order_shortcut.status != OrderStatuses.PAID:
         return
 
     funpay_order_id = order_shortcut.id
 
-    # Дубль-чек: уже есть в БД?
-    existing = db.query(Order).filter(Order.funpay_order_id == funpay_order_id).first()
-    if existing:
-        return
-
-    # Получаем полный ордер чтобы достать full_description (там хранится id: XXXXX)
-    try:
-        full_order = account.get_order(funpay_order_id)
-        full_desc = full_order.full_description or ""
-    except Exception as e:
-        logger.error(f"[{user_id}] Не удалось получить полный ордер {funpay_order_id}: {e}")
-        return
-
+    # Получаем полный ордер до открытия DB сессии — сетевой вызов под локом
+    with account_lock:
+        try:
+            full_order = account.get_order(funpay_order_id)
+        except Exception as e:
+            logger.error(f"[{user_id}] Не удалось получить полный ордер {funpay_order_id}: {e}")
+            return
+    full_desc = full_order.full_description or ""
     logger.debug(f"[{user_id}] full_description: {repr(full_desc)}")
 
-    # Найти автоматизацию по id: из подробного описания
-    automation = _find_automation(db, user_id, full_desc)
-    if not automation:
-        logger.info(f"[{user_id}] Нет активной автоматизации для ордера {funpay_order_id}, игнор")
-        return
+    with SyncSessionLocal() as db:
+        # Дубль-чек: уже есть в БД?
+        if db.query(Order).filter(Order.funpay_order_id == funpay_order_id).first():
+            return
 
-    # Проверить quantity
-    quantity = order_shortcut.amount
-    if quantity is None:
-        logger.error(f"[{user_id}] order {funpay_order_id}: amount=None — критическая ошибка, пропуск")
-        return
+        automation = _find_automation(db, user_id, full_desc)
+        if not automation:
+            logger.info(f"[{user_id}] Нет активной автоматизации для ордера {funpay_order_id}, игнор")
+            return
 
-    # Создать Order в БД
-    order = Order(
-        user_id=user_id,
-        funpay_order_id=funpay_order_id,
-        status=FunPayOrderStatus.PAID,
-        subcategory=order_shortcut.subcategory_name,
-        short_desc=order_shortcut.description,
-        sum_=order_shortcut.price,
-        quantity=quantity,
-        buyer_id=order_shortcut.buyer_id,
-        buyer_username=order_shortcut.buyer_username,
-        full_desc=full_desc,
-    )
-    db.add(order)
-    db.flush()
+        quantity = order_shortcut.amount
+        if quantity is None:
+            logger.error(f"[{user_id}] order {funpay_order_id}: amount=None — критическая ошибка, пропуск")
+            return
 
-    # Создать Service в статусе pending_input
-    service = Service(
-        order_id=order.order_id,
-        status=ServiceStatus.PENDING_INPUT,
-    )
-    db.add(service)
-    db.commit()
+        order = Order(
+            user_id=user_id,
+            funpay_order_id=funpay_order_id,
+            status=FunPayOrderStatus.PAID,
+            subcategory=order_shortcut.subcategory_name,
+            short_desc=order_shortcut.description,
+            sum_=order_shortcut.price,
+            quantity=quantity,
+            buyer_id=order_shortcut.buyer_id,
+            buyer_username=order_shortcut.buyer_username,
+            full_desc=full_desc,
+        )
+        db.add(order)
+        db.flush()
 
-    # Найти chat node по username покупателя из сохранённых чатов runner'а
-    chat_node = _find_chat_node(account, order_shortcut.buyer_username)
-    if chat_node is None:
-        logger.error(f"[{user_id}] Не найден chat node для {order_shortcut.buyer_username}, не можем написать")
-        return
+        service = Service(
+            order_id=order.order_id,
+            status=ServiceStatus.PENDING_INPUT,
+        )
+        db.add(service)
+        db.commit()
 
-    # Сохраняем chat_node в order для дальнейших сообщений
-    order.chat_node = chat_node
-    db.commit()
+        with account_lock:
+            chat_node = _find_chat_node(account, order_shortcut.buyer_username)
 
-    _send(account, chat_node,
-          "Привет! Заказ оплачен ✅\nОтправьте ссылку или ник для выполнения:")
+        if chat_node is None:
+            logger.error(f"[{user_id}] Не найден chat node для {order_shortcut.buyer_username}, не можем написать")
+            return
+
+        order.chat_node = chat_node
+        db.commit()
+
+    with account_lock:
+        _send(account, chat_node,
+              "Привет! Заказ оплачен ✅\nОтправьте ссылку или ник для выполнения:")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
-async def _handle_new_message(
+def _handle_new_message(
     event: NewMessageEvent,
     user_id: str,
     account: Account,
-    db: Session,
-    loop: asyncio.AbstractEventLoop,
+    account_lock: threading.Lock,
 ):
     msg = event.message
 
-    # Игнорируем свои сообщения
     if msg.by_bot or msg.author_id == account.id:
         return
 
-    text = (msg.text or "").strip()  # может быть пустым если сообщение — картинка/ссылка
+    text = (msg.text or "").strip()
     buyer_id = msg.author_id
-    chat_id = msg.chat_id  # node ID — используем напрямую из события
+    chat_id = msg.chat_id
 
-    # Найти активный заказ этого покупателя
-    order = _get_active_order(db, user_id, buyer_id)
-    if not order:
-        return
-
-    service: Service = order.service
-    if not service:
-        return
-
-    # Используем сохранённый chat_node если есть, иначе fallback на chat_id из события
-    effective_chat_id = order.chat_node or chat_id
-
-    # ── /retry ───────────────────────────────────────────────────────────────
-    if text == "/retry":
-        if service.status in (ServiceStatus.PENDING_INPUT, ServiceStatus.AWAITING_CONFIRM):
-            service.status = ServiceStatus.PENDING_INPUT
-            order.buyer_input = None
-            db.commit()
-            _send(account, effective_chat_id, "Хорошо, отправьте новую ссылку/ник:")
-        return
-
-    # ── pending_input: ждём ссылку/ник ───────────────────────────────────────
-    if service.status == ServiceStatus.PENDING_INPUT:
-        if not text:
+    with SyncSessionLocal() as db:
+        order = _get_active_order(db, user_id, buyer_id)
+        if not order:
             return
-        order.buyer_input = text
-        service.status = ServiceStatus.AWAITING_CONFIRM
-        db.commit()
-        _send(account, effective_chat_id,
-              f"Ваша ссылка/ник:\n{text}\n\n"
-              f"Перепроверьте и подтвердите:\n/yes — продолжить\n/no — отмена\n/retry — изменить")
-        return
 
-    # ── awaiting_confirm ──────────────────────────────────────────────────────
-    if service.status == ServiceStatus.AWAITING_CONFIRM:
-        if text == "/yes":
-            await _start_smm_order(order, service, db, account, chat_id, user_id, loop)
-        elif text == "/no":
-            service.status = ServiceStatus.FAILED
+        service: Service = order.service
+        if not service:
+            return
+
+        effective_chat_id = order.chat_node or chat_id
+
+        # ── /retry ───────────────────────────────────────────────────────────
+        if text == "/retry":
+            if service.status in (ServiceStatus.PENDING_INPUT, ServiceStatus.AWAITING_CONFIRM):
+                service.status = ServiceStatus.PENDING_INPUT
+                order.buyer_input = None
+                db.commit()
+                with account_lock:
+                    _send(account, effective_chat_id, "Хорошо, отправьте новую ссылку/ник:")
+            return
+
+        # ── pending_input: ждём ссылку/ник ───────────────────────────────────
+        if service.status == ServiceStatus.PENDING_INPUT:
+            if not text:
+                return
+            order.buyer_input = text
+            service.status = ServiceStatus.AWAITING_CONFIRM
             db.commit()
-            _send(account, effective_chat_id, "Заказ отменён.")
-        return
+            with account_lock:
+                _send(account, effective_chat_id,
+                      f"Ваша ссылка/ник:\n{text}\n\n"
+                      f"Перепроверьте и подтвердите:\n/yes — продолжить\n/no — отмена\n/retry — изменить")
+            return
 
-    # ── processing: /status ───────────────────────────────────────────────────
-    if service.status == ServiceStatus.PROCESSING:
-        if text == "/status":
-            _send(account, effective_chat_id, "⏳ Заказ в работе, ожидайте...")
-        return
+        # ── awaiting_confirm ──────────────────────────────────────────────────
+        if service.status == ServiceStatus.AWAITING_CONFIRM:
+            if text == "/yes":
+                _start_smm_order(order, service, db, account, account_lock, effective_chat_id, user_id)
+            elif text == "/no":
+                service.status = ServiceStatus.FAILED
+                db.commit()
+                with account_lock:
+                    _send(account, effective_chat_id, "Заказ отменён.")
+            return
+
+        # ── processing: /status ───────────────────────────────────────────────
+        if service.status == ServiceStatus.PROCESSING:
+            if text == "/status":
+                with account_lock:
+                    _send(account, effective_chat_id, "⏳ Заказ в работе, ожидайте...")
+            return
 
 
 # ── SMM Order Flow ────────────────────────────────────────────────────────────
 
-async def _start_smm_order(
+def _start_smm_order(
     order: Order,
     service: Service,
     db: Session,
     account: Account,
+    account_lock: threading.Lock,
     chat_id: int,
     user_id: str,
-    loop: asyncio.AbstractEventLoop,
 ):
-    # Найти хэш-запись (lot → smm_service)
     automation = _find_automation(db, user_id, order.full_desc or '')
     if not automation:
-        _send(account, chat_id, "❌ Ошибка конфигурации автоматизации. Свяжитесь с продавцом.")
+        with account_lock:
+            _send(account, chat_id, "❌ Ошибка конфигурации автоматизации. Свяжитесь с продавцом.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
@@ -377,34 +371,35 @@ async def _start_smm_order(
         LotServiceHash.lot_id == automation.lot_id
     ).first()
     if not lot_hash:
-        _send(account, chat_id, "❌ Ошибка: SMM сервис не настроен для этого лота.")
+        with account_lock:
+            _send(account, chat_id, "❌ Ошибка: SMM сервис не настроен для этого лота.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
 
     user: User = db.query(User).filter(User.user_id == user_id).first()
     if not user.smm_key:
-        _send(account, chat_id, "❌ Ошибка: SMM ключ не настроен. Свяжитесь с продавцом.")
+        with account_lock:
+            _send(account, chat_id, "❌ Ошибка: SMM ключ не настроен. Свяжитесь с продавцом.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
 
-    # Обновляем service
     service.smm_service_id = lot_hash.smm_service_id
     service.service_name = lot_hash.service_name
     db.flush()
 
-    # Отправляем заказ в SMM
     try:
-        smm_order_id = await smm_api.create_order(
+        smm_order_id = asyncio.run(smm_api.create_order(
             smm_key=user.smm_key,
             service_id=lot_hash.smm_service_id,
             link=order.buyer_input,
             quantity=order.quantity,
-        )
+        ))
     except smm_api.SMMError as e:
         logger.error(f"SMM create_order failed: {e}")
-        _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\nСвяжитесь с продавцом.")
+        with account_lock:
+            _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\nСвяжитесь с продавцом.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
@@ -413,27 +408,28 @@ async def _start_smm_order(
     service.status = ServiceStatus.PROCESSING
     db.commit()
 
-    _send(account, chat_id, "✅ Заказ принят в работу! Ожидайте.\nМожете проверить статус командой /status")
+    with account_lock:
+        _send(account, chat_id, "✅ Заказ принят в работу! Ожидайте.\nМожете проверить статус командой /status")
 
-    # Запускаем поллинг в отдельном потоке
     poll_thread = threading.Thread(
         target=_poll_smm_status,
-        args=(str(service.service_id), user_id, chat_id, account.golden_key),
+        args=(str(service.service_id), user_id, chat_id, account, account_lock),
         daemon=True,
     )
     poll_thread.start()
 
 
-def _poll_smm_status(service_id: str, user_id: str, chat_id: int, golden_key: str):
+def _poll_smm_status(
+    service_id: str,
+    user_id: str,
+    chat_id: int,
+    account: Account,
+    account_lock: threading.Lock,
+):
     """Поллинг статуса SMM заказа. Крутится пока не done/failed."""
     import time
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        account = Account(golden_key).get()
-
         while True:
             time.sleep(settings.SMM_POLLING_INTERVAL)
 
@@ -448,9 +444,7 @@ def _poll_smm_status(service_id: str, user_id: str, chat_id: int, golden_key: st
                 user: User = db.query(User).filter(User.user_id == user_id).first()
 
                 try:
-                    data = loop.run_until_complete(
-                        smm_api.get_status(user.smm_key, service.smm_order_id)
-                    )
+                    data = asyncio.run(smm_api.get_status(user.smm_key, service.smm_order_id))
                 except smm_api.SMMError as e:
                     logger.error(f"SMM status poll error: {e}")
                     continue
@@ -460,27 +454,24 @@ def _poll_smm_status(service_id: str, user_id: str, chat_id: int, golden_key: st
 
                 if smm_status == "Completed":
                     service.status = ServiceStatus.DONE
-                    # Обновляем FunPay статус заказа
                     order: Order = service.order
                     order.status = FunPayOrderStatus.CLOSED
                     db.commit()
-                    _send(account, chat_id,
-                          "✅ Заказ выполнен! Не забудьте подтвердить заказ на FunPay.")
+                    with account_lock:
+                        _send(account, chat_id,
+                              "✅ Заказ выполнен! Не забудьте подтвердить заказ на FunPay.")
                     break
 
                 elif smm_status in ("Canceled", "Fail", "Partial"):
                     service.status = ServiceStatus.FAILED
                     db.commit()
-                    _send(account, chat_id,
-                          f"❌ Заказ завершился со статусом: {smm_status}. Свяжитесь с продавцом.")
+                    with account_lock:
+                        _send(account, chat_id,
+                              f"❌ Заказ завершился со статусом: {smm_status}. Свяжитесь с продавцом.")
                     break
-
-                # In progress / Pending — продолжаем поллинг
 
     except Exception as e:
         logger.error(f"Polling thread crashed: {e}", exc_info=True)
-    finally:
-        loop.close()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -527,6 +518,7 @@ def _find_automation(db: Session, user_id: str, order_description: str) -> Curre
         )
         .first()
     )
+
 
 def _get_active_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
     """
