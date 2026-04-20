@@ -19,11 +19,32 @@ from services import smm as smm_api
 from config import settings
 
 try:
+    import requests as _requests
+    import FunPayAPI.account as _fp_account
+
+    # Патч: FunPayAPI шлёт запросы без locale — сайт отвечает /en/ и парсер не находит элементы.
+    # Принудительно выставляем locale=ru и нормальный User-Agent на каждую сессию.
+    _OrigSession = _requests.Session
+
+    class _PatchedSession(_OrigSession):
+        _UA = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.cookies.set("locale", "ru", domain="funpay.com")
+            self.headers["User-Agent"] = self._UA
+
+    _requests.Session = _PatchedSession
+    _fp_account.requests.Session = _PatchedSession
+
     from FunPayAPI.account import Account
     from FunPayAPI.updater.runner import Runner
     from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
     from FunPayAPI.common.enums import OrderStatuses
-    import FunPayAPI.account as _fp_account
 
     from bs4 import BeautifulSoup as _BS
     from FunPayAPI import types as _fp_types
@@ -535,7 +556,7 @@ def _get_pending_order(db: Session, user_id: str, buyer_id: int) -> Order | None
                 ServiceStatus.AWAITING_CONFIRM,
             ]),
         )
-        .order_by(Order.created_at.asc())  # oldest first — обрабатываем по порядку
+        .order_by(Order.created_at.asc())
         .first()
     )
 
