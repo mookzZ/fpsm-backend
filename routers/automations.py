@@ -35,6 +35,7 @@ class AutomationCreate(BaseModel):
 class AutomationOut(BaseModel):
     id: str
     lot_id: str
+    funpay_lot_id: str | None   # добавлено — фронт использует для фильтрации истории
     lot_title: str | None
     lot_subcategory: str | None
     smm_service_id: int
@@ -88,7 +89,6 @@ async def create_automation(
         if existing_auto.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Автоматизация для этого лота уже существует")
     else:
-        # Сохраняем только выбранный лот (не все лоты)
         lot = Lot(
             user_id=user.user_id,
             funpay_lot_id=payload.lot.funpay_lot_id,
@@ -121,7 +121,6 @@ async def create_automation(
     await db.refresh(automation)
     await db.refresh(automation, ["lot"])
 
-    # Запускаем воркер если не запущен
     from services.funpay_worker import worker_manager
     worker_manager.start(str(user.user_id))
 
@@ -173,11 +172,7 @@ async def delete_automation(
     await db.execute(delete(LotServiceHash).where(LotServiceHash.lot_id == lot_id))
     await db.delete(automation)
     await db.flush()
-    # Удаляем лот — он больше не нужен
-    lot_result = await db.execute(select(Lot).where(Lot.lot_id == lot_id))
-    lot = lot_result.scalar_one_or_none()
-    if lot:
-        await db.delete(lot)
+    # Лот не удаляем — к нему привязана история заказов
     await db.commit()
     return {"ok": True}
 
@@ -188,6 +183,7 @@ def _to_out(a: CurrentUserService) -> AutomationOut:
     return AutomationOut(
         id=str(a.id),
         lot_id=str(a.lot_id),
+        funpay_lot_id=a.lot.funpay_lot_id if a.lot else None,
         lot_title=a.lot.title if a.lot else None,
         lot_subcategory=a.lot.subcategory if a.lot else None,
         smm_service_id=a.smm_service_id,

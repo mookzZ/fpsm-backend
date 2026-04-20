@@ -25,9 +25,6 @@ try:
     from FunPayAPI.common.enums import OrderStatuses
     import FunPayAPI.account as _fp_account
 
-    # Monkey-patch: FunPayAPI крашится на сообщениях-ссылках
-    # Строка 1387 в account.py ищет div.message-text, но ссылки рендерятся как div.chat-msg-text
-    # Патчим __parse_messages чтобы фоллбэчил на chat-msg-text
     from bs4 import BeautifulSoup as _BS
     from FunPayAPI import types as _fp_types
 
@@ -72,7 +69,6 @@ try:
                     el = parser.find("div", {"class": "alert alert-with-icon alert-info"})
                     message_text = el.text.strip() if el else ""
                 else:
-                    # ФИКС: фоллбэк на chat-msg-text если message-text не найден
                     el = (parser.find("div", {"class": "message-text"}) or
                           parser.find("div", {"class": "chat-msg-text"}))
                     message_text = el.text if el else ""
@@ -177,7 +173,6 @@ def _worker_loop(user_id: str, stop_event: threading.Event):
         logger.error(f"[{user_id}] Не удалось инициализировать аккаунт: {e}")
         return
 
-    # Один лок на все FunPay API calls этого юзера — защита от race condition
     account_lock = threading.Lock()
     runner = Runner(account)
     logger.info(f"[{user_id}] Runner инициализирован как {account.username}")
@@ -217,7 +212,6 @@ def _handle_new_order(
 
     funpay_order_id = order_shortcut.id
 
-    # Получаем полный ордер до открытия DB сессии — сетевой вызов под локом
     with account_lock:
         try:
             full_order = account.get_order(funpay_order_id)
@@ -228,7 +222,6 @@ def _handle_new_order(
     logger.debug(f"[{user_id}] full_description: {repr(full_desc)}")
 
     with SyncSessionLocal() as db:
-        # Дубль-чек: уже есть в БД?
         if db.query(Order).filter(Order.funpay_order_id == funpay_order_id).first():
             return
 
@@ -276,7 +269,7 @@ def _handle_new_order(
 
     with account_lock:
         _send(account, chat_node,
-              "Привет! Заказ оплачен ✅\nОтправьте ссылку или ник для выполнения:")
+              f"Привет! Заказ #{funpay_order_id} оплачен ✅\nОтправьте ссылку или ник для выполнения:")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
@@ -296,7 +289,11 @@ def _handle_new_message(
     chat_id = msg.chat_id
 
     with SyncSessionLocal() as db:
-        order = _get_active_order(db, user_id, buyer_id)
+        # Ищем активный заказ: приоритет у PENDING_INPUT/AWAITING_CONFIRM (самый старый),
+        # иначе — PROCESSING. Это корректно обрабатывает несколько заказов в одном чате.
+        order = _get_pending_order(db, user_id, buyer_id)
+        if not order:
+            order = _get_processing_order(db, user_id, buyer_id)
         if not order:
             return
 
@@ -406,6 +403,7 @@ def _start_smm_order(
 
     service.smm_order_id = smm_order_id
     service.status = ServiceStatus.PROCESSING
+    funpay_order_id = order.funpay_order_id
     db.commit()
 
     with account_lock:
@@ -413,7 +411,7 @@ def _start_smm_order(
 
     poll_thread = threading.Thread(
         target=_poll_smm_status,
-        args=(str(service.service_id), user_id, chat_id, account, account_lock),
+        args=(str(service.service_id), funpay_order_id, user_id, chat_id, account, account_lock),
         daemon=True,
     )
     poll_thread.start()
@@ -421,6 +419,7 @@ def _start_smm_order(
 
 def _poll_smm_status(
     service_id: str,
+    funpay_order_id: str,
     user_id: str,
     chat_id: int,
     account: Account,
@@ -459,7 +458,7 @@ def _poll_smm_status(
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              "✅ Заказ выполнен! Не забудьте подтвердить заказ на FunPay.")
+                              f"✅ Заказ #{funpay_order_id} выполнен! Не забудьте подтвердить заказ на FunPay.")
                     break
 
                 elif smm_status in ("Canceled", "Fail", "Partial"):
@@ -467,7 +466,7 @@ def _poll_smm_status(
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              f"❌ Заказ завершился со статусом: {smm_status}. Свяжитесь с продавцом.")
+                              f"❌ Заказ #{funpay_order_id} завершился со статусом: {smm_status}. Свяжитесь с продавцом.")
                     break
 
     except Exception as e:
@@ -484,7 +483,6 @@ def _send(account: Account, chat_id: int, text: str):
 
 
 def _find_chat_node(account: Account, buyer_username: str) -> int | None:
-    """Ищет chat node по username покупателя в сохранённых чатах Runner'а."""
     try:
         saved = account._Account__saved_chats  # dict {node_id: ChatShortcut}
         for node_id, chat in saved.items():
@@ -520,10 +518,10 @@ def _find_automation(db: Session, user_id: str, order_description: str) -> Curre
     )
 
 
-def _get_active_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
+def _get_pending_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
     """
-    Возвращает последний активный (PAID) ордер покупателя у данного продавца,
-    у которого сервис ещё не завершён.
+    Возвращает самый старый заказ покупателя в статусе PENDING_INPUT или AWAITING_CONFIRM.
+    Это гарантирует последовательную обработку при нескольких заказах в одном чате.
     """
     return (
         db.query(Order)
@@ -535,8 +533,23 @@ def _get_active_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
             Service.status.in_([
                 ServiceStatus.PENDING_INPUT,
                 ServiceStatus.AWAITING_CONFIRM,
-                ServiceStatus.PROCESSING,
             ]),
+        )
+        .order_by(Order.created_at.asc())  # oldest first — обрабатываем по порядку
+        .first()
+    )
+
+
+def _get_processing_order(db: Session, user_id: str, buyer_id: int) -> Order | None:
+    """Возвращает заказ в статусе PROCESSING (для /status команды)."""
+    return (
+        db.query(Order)
+        .join(Service, Service.order_id == Order.order_id)
+        .filter(
+            Order.user_id == user_id,
+            Order.buyer_id == buyer_id,
+            Order.status == FunPayOrderStatus.PAID,
+            Service.status == ServiceStatus.PROCESSING,
         )
         .order_by(Order.created_at.desc())
         .first()

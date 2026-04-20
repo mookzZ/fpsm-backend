@@ -3,7 +3,7 @@ import httpx
 
 logger = logging.getLogger("smm")
 
-SMM_BASE = "https://twiboost.com/api/v2"
+SMM_BASE = "https://bestsmmlike.ru/api/v2"
 
 
 class SMMError(Exception):
@@ -12,10 +12,10 @@ class SMMError(Exception):
 
 async def create_order(smm_key: str, service_id: int, link: str, quantity: int) -> int:
     """
-    Создаёт заказ в SMMWay.
+    Создаёт заказ в SMM-панели.
     Возвращает smm_order_id.
     """
-    params = {
+    data = {
         "action": "add",
         "key": smm_key,
         "service": service_id,
@@ -23,16 +23,16 @@ async def create_order(smm_key: str, service_id: int, link: str, quantity: int) 
         "quantity": quantity,
     }
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(SMM_BASE, params=params)
+        resp = await client.post(SMM_BASE, data=data)
         resp.raise_for_status()
-        data = resp.json()
+        result = resp.json()
 
-    if "error" in data:
-        raise SMMError(f"SMMWay error: {data['error']}")
-    if "order" not in data:
-        raise SMMError(f"SMMWay unexpected response: {data}")
+    if "error" in result:
+        raise SMMError(f"SMM error: {result['error']}")
+    if "order" not in result:
+        raise SMMError(f"SMM unexpected response: {result}")
 
-    order_id = int(data["order"])
+    order_id = int(result["order"])
     logger.info(f"SMM order created: {order_id}")
     return order_id
 
@@ -40,19 +40,19 @@ async def create_order(smm_key: str, service_id: int, link: str, quantity: int) 
 async def get_status(smm_key: str, smm_order_id: int) -> dict:
     """
     Возвращает dict с полями: status, charge, start_count, remains, currency
-    Возможные статусы от smmway: Pending | In progress | Completed | Partial | Canceled | Fail
+    Возможные статусы: Pending | In progress | Completed | Partial | Canceled | Fail
     """
-    params = {
+    data = {
         "action": "status",
         "key": smm_key,
         "order": smm_order_id,
     }
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(SMM_BASE, params=params)
+        resp = await client.post(SMM_BASE, data=data)
         resp.raise_for_status()
-        data = resp.json()
+        result = resp.json()
 
-    if "error" in data:
-        raise SMMError(f"SMMWay status error: {data['error']}")
+    if "error" in result:
+        raise SMMError(f"SMM status error: {result['error']}")
 
-    return data
+    return result
