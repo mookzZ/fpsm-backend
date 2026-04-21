@@ -121,7 +121,7 @@ try:
         try:
             return _orig_generate_new_message_events(self, obj)
         except (IndexError, KeyError, TypeError):
-            return []
+            return {}
 
     _fp_runner.Runner.generate_new_message_events = _safe_generate_new_message_events
 
