@@ -291,8 +291,8 @@ def _handle_new_order(
     with account_lock:
         _send(account, chat_node,
               f"Заказ #{funpay_order_id} оплачен ✅\n"
-              f"📎 Отправьте ссылку для выполнения заказа:\n\n"
-              f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.")
+              f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.\n\n"
+              f"📎 Отправьте ссылку для выполнения заказа:")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
@@ -568,6 +568,7 @@ def _handle_status_command(
             _send(account, chat_id, f"❌ Заказ #{order_id_str} вам не принадлежит.")
             return
 
+        effective_chat_id = order.chat_node or chat_id
         svc = order.service
         smm_id   = str(svc.smm_order_id) if svc and svc.smm_order_id else "—"
         date_str = svc.date.strftime("%Y-%m-%d %H:%M:%S") if svc and svc.date else "—"
@@ -575,7 +576,7 @@ def _handle_status_command(
         count    = str(order.quantity) if order.quantity else "—"
         status   = _service_status_label(svc.status if svc else None)
 
-        _send(account, chat_id,
+        _send(account, effective_chat_id,
               f"ID: {smm_id}\n"
               f"Date: {date_str}\n"
               f"Link: {link}\n"
@@ -612,6 +613,7 @@ def _handle_operator_command(
             return
 
         funpay_order_id = order.funpay_order_id
+        effective_chat_id = order.chat_node or chat_id
         order.service.status = ServiceStatus.OPERATOR_REQUESTED
         db.commit()
 
@@ -619,7 +621,7 @@ def _handle_operator_command(
         seller: User = db.query(User).filter(User.user_id == user_id).first()
         seller_telegram_id = seller.telegram_id if seller else None
 
-    _send(account, chat_id,
+    _send(account, effective_chat_id,
           "✅ Запрос отправлен. Продавец увидит его в панели управления и свяжется с вами.")
 
     # Уведомляем продавца в Telegram (вне db-сессии, не блокируем если упадёт)
