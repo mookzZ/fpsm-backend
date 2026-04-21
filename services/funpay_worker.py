@@ -304,7 +304,7 @@ def _handle_new_order(
     with account_lock:
         _send(account, chat_node,
               f"Заказ #{funpay_order_id} оплачен ✅\n"
-              f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.\n\n"
+              # f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.\n\n"
               f"📎 Отправьте ссылку для выполнения заказа:")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
