@@ -112,6 +112,19 @@ try:
 
     _fp_account.Account._Account__parse_messages = _fixed_parse_messages
 
+    # Патч: FunPayAPI Runner крашится на messages[-1] когда список пустой.
+    # Это происходит когда все сообщения в ответе уже старше from_id (например после отправки боtом).
+    from FunPayAPI.updater import runner as _fp_runner
+    _orig_generate_new_message_events = _fp_runner.Runner.generate_new_message_events
+
+    def _safe_generate_new_message_events(self, obj):
+        try:
+            return _orig_generate_new_message_events(self, obj)
+        except (IndexError, KeyError, TypeError):
+            return []
+
+    _fp_runner.Runner.generate_new_message_events = _safe_generate_new_message_events
+
 except ImportError:
     raise RuntimeError("FunPayAPI не установлен. pip install FunPayAPI")
 
@@ -624,6 +637,7 @@ def _handle_operator_command(
                 Order.status == FunPayOrderStatus.PAID,
                 Service.status.notin_([
                     ServiceStatus.DONE,
+                    ServiceStatus.FAILED,
                     ServiceStatus.OPERATOR_REQUESTED,
                 ]),
             )
