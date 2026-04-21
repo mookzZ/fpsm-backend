@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Integer, Float, Boolean,
+    Column, String, Integer, BigInteger, Float, Boolean,
     DateTime, ForeignKey, Text, Enum as SAEnum
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -35,7 +35,7 @@ class User(Base):
     __tablename__ = "users"
 
     user_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    telegram_id = Column(Integer, unique=True, nullable=False, index=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     username = Column(String(128), nullable=True)
     golden_key = Column(String(512), nullable=True)
     smm_key = Column(String(512), nullable=True)
