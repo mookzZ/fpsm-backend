@@ -624,7 +624,6 @@ def _handle_operator_command(
                 Order.status == FunPayOrderStatus.PAID,
                 Service.status.notin_([
                     ServiceStatus.DONE,
-                    ServiceStatus.FAILED,
                     ServiceStatus.OPERATOR_REQUESTED,
                 ]),
             )
