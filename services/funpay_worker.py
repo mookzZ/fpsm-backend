@@ -290,7 +290,7 @@ def _handle_new_order(
 
     with account_lock:
         _send(account, chat_node,
-              f"Привет! Заказ #{funpay_order_id} оплачен ✅\nОтправьте ссылку или ник для выполнения:")
+              f"Здравствуйте.\nЗаказ #{funpay_order_id} оплачен ✅\n📎Отправьте ссылку для выполнения заказа:")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
@@ -324,8 +324,8 @@ def _handle_new_message(
 
         effective_chat_id = order.chat_node or chat_id
 
-        # ── /retry ───────────────────────────────────────────────────────────
-        if text == "/retry":
+        # ── /change ───────────────────────────────────────────────────────────
+        if text == "/change":
             if service.status in (ServiceStatus.PENDING_INPUT, ServiceStatus.AWAITING_CONFIRM):
                 service.status = ServiceStatus.PENDING_INPUT
                 order.buyer_input = None
@@ -343,19 +343,19 @@ def _handle_new_message(
             db.commit()
             with account_lock:
                 _send(account, effective_chat_id,
-                      f"Ваша ссылка/ник:\n{text}\n\n"
-                      f"Перепроверьте и подтвердите:\n/yes — продолжить\n/no — отмена\n/retry — изменить")
+                      f"🔗 Ваша ссылка:\n↳ {text}\n\n"
+                      f"⚠️ Перепроверьте ссылку внимательно.\nВыберите действие:\n• /next — ссылка верна → продолжить выполнение\n• /cancel — отмена заказа → средства будут возвращены\n• /change — изменить ссылку → указать новую")
             return
 
         # ── awaiting_confirm ──────────────────────────────────────────────────
         if service.status == ServiceStatus.AWAITING_CONFIRM:
-            if text == "/yes":
+            if text == "/next":
                 _start_smm_order(order, service, db, account, account_lock, effective_chat_id, user_id)
-            elif text == "/no":
+            elif text == "/cancel":
                 service.status = ServiceStatus.FAILED
                 db.commit()
                 with account_lock:
-                    _send(account, effective_chat_id, "Заказ отменён.")
+                    _send(account, effective_chat_id, "Заказ отменён. Ожидайте возврат средств продавцом.")
             return
 
         # ── processing: /status ───────────────────────────────────────────────
@@ -380,7 +380,7 @@ def _start_smm_order(
     automation = _find_automation(db, user_id, order.full_desc or '')
     if not automation:
         with account_lock:
-            _send(account, chat_id, "❌ Ошибка конфигурации автоматизации. Свяжитесь с продавцом.")
+            _send(account, chat_id, "❌ Ошибка конфигурации автоматизации.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
@@ -398,7 +398,7 @@ def _start_smm_order(
     user: User = db.query(User).filter(User.user_id == user_id).first()
     if not user.smm_key:
         with account_lock:
-            _send(account, chat_id, "❌ Ошибка: SMM ключ не настроен. Свяжитесь с продавцом.")
+            _send(account, chat_id, "❌ Ошибка: SMM ключ не настроен.")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
@@ -417,7 +417,7 @@ def _start_smm_order(
     except smm_api.SMMError as e:
         logger.error(f"SMM create_order failed: {e}")
         with account_lock:
-            _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\nСвяжитесь с продавцом.")
+            _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\n")
         service.status = ServiceStatus.FAILED
         db.commit()
         return
@@ -428,7 +428,7 @@ def _start_smm_order(
     db.commit()
 
     with account_lock:
-        _send(account, chat_id, "✅ Заказ принят в работу! Ожидайте.\nМожете проверить статус командой /status")
+        _send(account, chat_id, "✔️ Заказ [номер заказа] сформирован и начал выполнятся.\n🔍 Проверить статус можно командой: /status [номер заказа]")
 
     poll_thread = threading.Thread(
         target=_poll_smm_status,
@@ -479,7 +479,7 @@ def _poll_smm_status(
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              f"✅ Заказ #{funpay_order_id} выполнен! Не забудьте подтвердить заказ на FunPay.")
+                              f"✔️ Заказ #{funpay_order_id} выполнен. Пожалуйста, зайдите в раздел «Покупки», выберите его в списке и нажмите кнопку «Подтвердить выполнение заказа».")
                     break
 
                 elif smm_status in ("Canceled", "Fail", "Partial"):
@@ -487,7 +487,7 @@ def _poll_smm_status(
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              f"❌ Заказ #{funpay_order_id} завершился со статусом: {smm_status}. Свяжитесь с продавцом.")
+                              f"❌ Заказ #{funpay_order_id} завершился со статусом: {smm_status}.")
                     break
 
     except Exception as e:
