@@ -8,7 +8,7 @@ import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from database import SyncSessionLocal
 from models import (
@@ -290,7 +290,9 @@ def _handle_new_order(
 
     with account_lock:
         _send(account, chat_node,
-              f"Здравствуйте.\nЗаказ #{funpay_order_id} оплачен ✅\n📎Отправьте ссылку для выполнения заказа:")
+              f"Здравствуйте.\nЗаказ #{funpay_order_id} оплачен ✅\n"
+              f"📎 Отправьте ссылку для выполнения заказа:\n\n"
+              f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
 
 
@@ -308,6 +310,17 @@ def _handle_new_message(
     text = (msg.text or "").strip()
     buyer_id = msg.author_id
     chat_id = msg.chat_id
+
+    # ── Глобальные команды (работают независимо от статуса заказа) ─────────────
+    if text.startswith("/status "):
+        with account_lock:
+            _handle_status_command(text, buyer_id, chat_id, user_id, account)
+        return
+
+    if text == "/operator":
+        with account_lock:
+            _handle_operator_command(buyer_id, chat_id, user_id, account)
+        return
 
     with SyncSessionLocal() as db:
         # Ищем активный заказ: приоритет у PENDING_INPUT/AWAITING_CONFIRM (самый старый),
@@ -344,7 +357,10 @@ def _handle_new_message(
             with account_lock:
                 _send(account, effective_chat_id,
                       f"🔗 Ваша ссылка:\n↳ {text}\n\n"
-                      f"⚠️ Перепроверьте ссылку внимательно.\nВыберите действие:\n• /next — ссылка верна → продолжить выполнение\n• /cancel — отмена заказа → средства будут возвращены\n• /change — изменить ссылку → указать новую")
+                      f"⚠️ Перепроверьте ссылку внимательно.\nВыберите действие:\n"
+                      f"• /next — ссылка верна → продолжить выполнение\n"
+                      f"• /cancel — отмена заказа → средства будут возвращены\n"
+                      f"• /change — изменить ссылку → указать новую")
             return
 
         # ── awaiting_confirm ──────────────────────────────────────────────────
@@ -356,13 +372,6 @@ def _handle_new_message(
                 db.commit()
                 with account_lock:
                     _send(account, effective_chat_id, "Заказ отменён. Ожидайте возврат средств продавцом.")
-            return
-
-        # ── processing: /status ───────────────────────────────────────────────
-        if service.status == ServiceStatus.PROCESSING:
-            if text == "/status":
-                with account_lock:
-                    _send(account, effective_chat_id, "⏳ Заказ в работе, ожидайте...")
             return
 
 
@@ -381,7 +390,7 @@ def _start_smm_order(
     if not automation:
         with account_lock:
             _send(account, chat_id, "❌ Ошибка конфигурации автоматизации.")
-        service.status = ServiceStatus.FAILED
+        service.status = ServiceStatus.NEEDS_ATTENTION
         db.commit()
         return
 
@@ -391,7 +400,7 @@ def _start_smm_order(
     if not lot_hash:
         with account_lock:
             _send(account, chat_id, "❌ Ошибка: SMM сервис не настроен для этого лота.")
-        service.status = ServiceStatus.FAILED
+        service.status = ServiceStatus.NEEDS_ATTENTION
         db.commit()
         return
 
@@ -399,7 +408,7 @@ def _start_smm_order(
     if not user.smm_key:
         with account_lock:
             _send(account, chat_id, "❌ Ошибка: SMM ключ не настроен.")
-        service.status = ServiceStatus.FAILED
+        service.status = ServiceStatus.NEEDS_ATTENTION
         db.commit()
         return
 
@@ -418,21 +427,24 @@ def _start_smm_order(
         logger.error(f"SMM create_order failed: {e}")
         with account_lock:
             _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\n")
-        service.status = ServiceStatus.FAILED
+        service.status = ServiceStatus.NEEDS_ATTENTION
         db.commit()
         return
 
     service.smm_order_id = smm_order_id
     service.status = ServiceStatus.PROCESSING
     funpay_order_id = order.funpay_order_id
+    buyer_username = order.buyer_username or ""
     db.commit()
 
     with account_lock:
-        _send(account, chat_id, "✔️ Заказ [номер заказа] сформирован и начал выполнятся.\n🔍 Проверить статус можно командой: /status [номер заказа]")
+        _send(account, chat_id,
+              f"✔️ Заказ #{funpay_order_id} сформирован и начал выполняться.\n"
+              f"🔍 Проверить статус: /status #{funpay_order_id}")
 
     poll_thread = threading.Thread(
         target=_poll_smm_status,
-        args=(str(service.service_id), funpay_order_id, user_id, chat_id, account, account_lock),
+        args=(str(service.service_id), funpay_order_id, user_id, chat_id, account, account_lock, buyer_username),
         daemon=True,
     )
     poll_thread.start()
@@ -445,6 +457,7 @@ def _poll_smm_status(
     chat_id: int,
     account: Account,
     account_lock: threading.Lock,
+    buyer_username: str = "",
 ):
     """Поллинг статуса SMM заказа. Крутится пока не done/failed."""
     import time
@@ -458,7 +471,9 @@ def _poll_smm_status(
                     Service.service_id == service_id
                 ).first()
 
-                if not service or service.status in (ServiceStatus.DONE, ServiceStatus.FAILED):
+                if not service or service.status in (
+                    ServiceStatus.DONE, ServiceStatus.FAILED, ServiceStatus.NEEDS_ATTENTION
+                ):
                     break
 
                 user: User = db.query(User).filter(User.user_id == user_id).first()
@@ -479,15 +494,20 @@ def _poll_smm_status(
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              f"✔️ Заказ #{funpay_order_id} выполнен. Пожалуйста, зайдите в раздел «Покупки», выберите его в списке и нажмите кнопку «Подтвердить выполнение заказа».")
+                              f"✔️ Заказ #{funpay_order_id} выполнен. Пожалуйста, зайдите в раздел «Покупки», "
+                              f"выберите его в списке и нажмите «Подтвердить выполнение заказа».")
+                        time.sleep(0.5)
+                        _send(account, chat_id,
+                              f"@{buyer_username}, просим вас оставить отзыв о качестве выполненной работы.")
                     break
 
                 elif smm_status in ("Canceled", "Fail", "Partial"):
-                    service.status = ServiceStatus.FAILED
+                    service.status = ServiceStatus.NEEDS_ATTENTION
                     db.commit()
                     with account_lock:
                         _send(account, chat_id,
-                              f"❌ Заказ #{funpay_order_id} завершился со статусом: {smm_status}.")
+                              f"⚠️ Заказ #{funpay_order_id} завершился со статусом: {smm_status}. "
+                              f"Продавец разберётся и свяжется с вами.")
                     break
 
     except Exception as e:
@@ -495,6 +515,101 @@ def _poll_smm_status(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Status label helper ────────────────────────────────────────────────────────
+
+_STATUS_LABEL_MAP = {
+    ServiceStatus.PENDING_INPUT:       "Ожидание",
+    ServiceStatus.AWAITING_CONFIRM:    "Ожидание",
+    ServiceStatus.PROCESSING:          "Выполняется",
+    ServiceStatus.DONE:                "Выполнен",
+    ServiceStatus.FAILED:              "Отменен",
+    ServiceStatus.NEEDS_ATTENTION:     "Ожидает решения",
+    ServiceStatus.OPERATOR_REQUESTED:  "Оператор",
+}
+
+
+def _service_status_label(status) -> str:
+    return _STATUS_LABEL_MAP.get(status, "—") if status else "—"
+
+
+def _handle_status_command(
+    text: str,
+    buyer_id: int,
+    chat_id: int,
+    user_id: str,
+    account: "Account",
+):
+    """Обрабатывает /status #ORDER123 — защищена от просмотра чужих заказов."""
+    import re as _re
+    m = _re.match(r"^/status\s+#?(\S+)$", text.strip())
+    if not m:
+        return
+    order_id_str = m.group(1).strip()
+
+    with SyncSessionLocal() as db:
+        order: Order = (
+            db.query(Order)
+            .options(joinedload(Order.service))
+            .filter(Order.funpay_order_id == order_id_str)
+            .first()
+        )
+        if not order:
+            _send(account, chat_id, f"❌ Заказ #{order_id_str} не найден.")
+            return
+        if order.buyer_id != buyer_id:
+            _send(account, chat_id, f"❌ Заказ #{order_id_str} вам не принадлежит.")
+            return
+
+        svc = order.service
+        smm_id   = str(svc.smm_order_id) if svc and svc.smm_order_id else "—"
+        date_str = svc.date.strftime("%Y-%m-%d %H:%M:%S") if svc and svc.date else "—"
+        link     = order.buyer_input or "—"
+        count    = str(order.quantity) if order.quantity else "—"
+        status   = _service_status_label(svc.status if svc else None)
+
+        _send(account, chat_id,
+              f"ID:     {smm_id}\n"
+              f"Date:   {date_str}\n"
+              f"Link:   {link}\n"
+              f"Count:  {count}\n"
+              f"Status: {status}")
+
+
+def _handle_operator_command(
+    buyer_id: int,
+    chat_id: int,
+    user_id: str,
+    account: "Account",
+):
+    """Покупатель запрашивает продавца — статус → OPERATOR_REQUESTED."""
+    with SyncSessionLocal() as db:
+        order: Order = (
+            db.query(Order)
+            .join(Service, Service.order_id == Order.order_id)
+            .filter(
+                Order.user_id == user_id,
+                Order.buyer_id == buyer_id,
+                Order.status == FunPayOrderStatus.PAID,
+                Service.status.in_([
+                    ServiceStatus.PENDING_INPUT,
+                    ServiceStatus.AWAITING_CONFIRM,
+                    ServiceStatus.PROCESSING,
+                    ServiceStatus.NEEDS_ATTENTION,
+                ]),
+            )
+            .order_by(Order.created_at.desc())
+            .first()
+        )
+        if not order:
+            _send(account, chat_id, "❌ Нет активного заказа для обращения к продавцу.")
+            return
+
+        order.service.status = ServiceStatus.OPERATOR_REQUESTED
+        db.commit()
+        _send(account, chat_id,
+              "✅ Запрос отправлен. Продавец увидит его в панели управления и свяжется с вами.")
+
 
 def _send(account: Account, chat_id: int, text: str):
     try:

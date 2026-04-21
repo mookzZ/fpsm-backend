@@ -25,6 +25,8 @@ class ServiceStatus(str, enum.Enum):
     PROCESSING = "processing"
     DONE = "done"
     FAILED = "failed"
+    NEEDS_ATTENTION = "needs_attention"      # системная/SMM ошибка — требует ручного решения
+    OPERATOR_REQUESTED = "operator_requested"  # покупатель запросил продавца
 
 
 # ── Tables ───────────────────────────────────────────────────────────────────
