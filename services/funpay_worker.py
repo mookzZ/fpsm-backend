@@ -304,7 +304,14 @@ def _handle_new_message(
 ):
     msg = event.message
 
+    logger.debug(
+        f"[{user_id}] NewMessageEvent: author_id={msg.author_id} "
+        f"by_bot={msg.by_bot} account_id={account.id} "
+        f"chat_id={msg.chat_id} text={repr(msg.text)}"
+    )
+
     if msg.by_bot or msg.author_id == account.id:
+        logger.debug(f"[{user_id}] Сообщение отфильтровано: by_bot={msg.by_bot} is_self={msg.author_id == account.id}")
         return
 
     text = (msg.text or "").strip()
@@ -318,6 +325,7 @@ def _handle_new_message(
         return
 
     if text == "/operator":
+        logger.info(f"[{user_id}] /operator от buyer_id={buyer_id} chat_id={chat_id}")
         with account_lock:
             _handle_operator_command(buyer_id, chat_id, user_id, account)
         return
@@ -591,7 +599,22 @@ def _handle_operator_command(
     account: "Account",
 ):
     """Покупатель запрашивает продавца — статус → OPERATOR_REQUESTED."""
+    logger.info(f"[{user_id}] _handle_operator_command: buyer_id={buyer_id} chat_id={chat_id}")
     with SyncSessionLocal() as db:
+        # Диагностика: все заказы этого покупателя
+        all_orders = (
+            db.query(Order)
+            .join(Service, Service.order_id == Order.order_id)
+            .filter(Order.user_id == user_id, Order.buyer_id == buyer_id)
+            .all()
+        )
+        for o in all_orders:
+            logger.info(
+                f"[{user_id}] Заказ покупателя: funpay_id={o.funpay_order_id} "
+                f"order_status={o.status} service_status={o.service.status if o.service else 'NO_SERVICE'} "
+                f"chat_node={o.chat_node}"
+            )
+
         order: Order = (
             db.query(Order)
             .join(Service, Service.order_id == Order.order_id)
@@ -609,13 +632,16 @@ def _handle_operator_command(
             .first()
         )
         if not order:
+            logger.warning(f"[{user_id}] /operator: активный заказ не найден для buyer_id={buyer_id}")
             _send(account, chat_id, "❌ Нет активного заказа для обращения к продавцу.")
             return
 
+        logger.info(f"[{user_id}] /operator: найден заказ {order.funpay_order_id} chat_node={order.chat_node}")
         funpay_order_id = order.funpay_order_id
         effective_chat_id = order.chat_node or chat_id
         order.service.status = ServiceStatus.OPERATOR_REQUESTED
         db.commit()
+        logger.info(f"[{user_id}] /operator: статус → OPERATOR_REQUESTED, отправляем в chat_id={effective_chat_id}")
 
         # Получаем telegram_id продавца для уведомления
         seller: User = db.query(User).filter(User.user_id == user_id).first()
@@ -623,6 +649,7 @@ def _handle_operator_command(
 
     _send(account, effective_chat_id,
           "✅ Запрос отправлен. Продавец увидит его в панели управления и свяжется с вами.")
+    logger.info(f"[{user_id}] /operator: сообщение отправлено покупателю")
 
     # Уведомляем продавца в Telegram (вне db-сессии, не блокируем если упадёт)
     threading.Thread(
@@ -636,7 +663,7 @@ def _send(account: Account, chat_id: int, text: str):
     try:
         account.send_message(chat_id, text)
     except Exception as e:
-        logger.error(f"send_message failed: {e}")
+        logger.error(f"send_message failed: chat_id={chat_id} error={e}", exc_info=True)
 
 
 def _notify_telegram_operator(telegram_id: int, funpay_order_id: str):
