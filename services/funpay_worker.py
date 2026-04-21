@@ -290,7 +290,7 @@ def _handle_new_order(
 
     with account_lock:
         _send(account, chat_node,
-              f"Здравствуйте.\nЗаказ #{funpay_order_id} оплачен ✅\n"
+              f"Заказ #{funpay_order_id} оплачен ✅\n"
               f"📎 Отправьте ссылку для выполнения заказа:\n\n"
               f"💬 Возникнут вопросы — напишите /operator для связи с продавцом.")
     logger.info(f"[{user_id}] Новый заказ {funpay_order_id} создан, chat_node={chat_node}, ждём инпут от {order_shortcut.buyer_username}")
@@ -344,7 +344,7 @@ def _handle_new_message(
                 order.buyer_input = None
                 db.commit()
                 with account_lock:
-                    _send(account, effective_chat_id, "Хорошо, отправьте новую ссылку/ник:")
+                    _send(account, effective_chat_id, "🔄 Отправьте новую ссылку:")
             return
 
         # ── pending_input: ждём ссылку/ник ───────────────────────────────────
@@ -371,7 +371,7 @@ def _handle_new_message(
                 service.status = ServiceStatus.FAILED
                 db.commit()
                 with account_lock:
-                    _send(account, effective_chat_id, "Заказ отменён. Ожидайте возврат средств продавцом.")
+                    _send(account, effective_chat_id, "❌ Заказ отменён. Ожидайте возврат средств продавцом.")
             return
 
 
@@ -414,6 +414,8 @@ def _start_smm_order(
 
     service.smm_service_id = lot_hash.smm_service_id
     service.service_name = lot_hash.service_name
+    service_id_str = str(service.service_id)
+    order_id_str = str(order.order_id)
     db.flush()
 
     try:
@@ -423,12 +425,17 @@ def _start_smm_order(
             link=order.buyer_input,
             quantity=order.quantity,
         ))
-    except smm_api.SMMError as e:
+    except Exception as e:
         logger.error(f"SMM create_order failed: {e}")
         with account_lock:
-            _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\n")
-        service.status = ServiceStatus.NEEDS_ATTENTION
-        db.commit()
+            _send(account, chat_id, f"❌ Ошибка при создании SMM заказа: {e}\n"
+                                    f"Напишите /operator для связи с продавцом.")
+        # Используем свежую сессию — shared db может быть в неконсистентном состоянии
+        with SyncSessionLocal() as fresh_db:
+            svc = fresh_db.query(Service).filter(Service.service_id == service_id_str).first()
+            if svc:
+                svc.status = ServiceStatus.NEEDS_ATTENTION
+                fresh_db.commit()
         return
 
     service.smm_order_id = smm_order_id
@@ -498,7 +505,7 @@ def _poll_smm_status(
                               f"выберите его в списке и нажмите «Подтвердить выполнение заказа».")
                         time.sleep(0.5)
                         _send(account, chat_id,
-                              f"@{buyer_username}, просим вас оставить отзыв о качестве выполненной работы.")
+                              f"⭐️ {buyer_username}, просим вас оставить отзыв о качестве выполненной работы.")
                     break
 
                 elif smm_status in ("Canceled", "Fail", "Partial"):
@@ -569,10 +576,10 @@ def _handle_status_command(
         status   = _service_status_label(svc.status if svc else None)
 
         _send(account, chat_id,
-              f"ID:     {smm_id}\n"
-              f"Date:   {date_str}\n"
-              f"Link:   {link}\n"
-              f"Count:  {count}\n"
+              f"ID: {smm_id}\n"
+              f"Date: {date_str}\n"
+              f"Link: {link}\n"
+              f"Count: {count}\n"
               f"Status: {status}")
 
 
@@ -591,11 +598,10 @@ def _handle_operator_command(
                 Order.user_id == user_id,
                 Order.buyer_id == buyer_id,
                 Order.status == FunPayOrderStatus.PAID,
-                Service.status.in_([
-                    ServiceStatus.PENDING_INPUT,
-                    ServiceStatus.AWAITING_CONFIRM,
-                    ServiceStatus.PROCESSING,
-                    ServiceStatus.NEEDS_ATTENTION,
+                Service.status.notin_([
+                    ServiceStatus.DONE,
+                    ServiceStatus.FAILED,
+                    ServiceStatus.OPERATOR_REQUESTED,
                 ]),
             )
             .order_by(Order.created_at.desc())
@@ -605,10 +611,23 @@ def _handle_operator_command(
             _send(account, chat_id, "❌ Нет активного заказа для обращения к продавцу.")
             return
 
+        funpay_order_id = order.funpay_order_id
         order.service.status = ServiceStatus.OPERATOR_REQUESTED
         db.commit()
-        _send(account, chat_id,
-              "✅ Запрос отправлен. Продавец увидит его в панели управления и свяжется с вами.")
+
+        # Получаем telegram_id продавца для уведомления
+        seller: User = db.query(User).filter(User.user_id == user_id).first()
+        seller_telegram_id = seller.telegram_id if seller else None
+
+    _send(account, chat_id,
+          "✅ Запрос отправлен. Продавец увидит его в панели управления и свяжется с вами.")
+
+    # Уведомляем продавца в Telegram (вне db-сессии, не блокируем если упадёт)
+    threading.Thread(
+        target=_notify_telegram_operator,
+        args=(seller_telegram_id, funpay_order_id),
+        daemon=True,
+    ).start()
 
 
 def _send(account: Account, chat_id: int, text: str):
@@ -616,6 +635,25 @@ def _send(account: Account, chat_id: int, text: str):
         account.send_message(chat_id, text)
     except Exception as e:
         logger.error(f"send_message failed: {e}")
+
+
+def _notify_telegram_operator(telegram_id: int, funpay_order_id: str):
+    """Шлёт продавцу Telegram-сообщение о запросе оператора."""
+    token = settings.TELEGRAM_BOT_TOKEN
+    if not token or not telegram_id:
+        logger.warning("TELEGRAM_BOT_TOKEN не задан или telegram_id пуст — уведомление не отправлено")
+        return
+    try:
+        import requests as _req
+        resp = _req.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": telegram_id, "text": f"Ордер #{funpay_order_id} запрошен оператор"},
+            timeout=5,
+        )
+        if not resp.ok:
+            logger.error(f"Telegram notify failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"Telegram notify error: {e}")
 
 
 def _find_chat_node(account: Account, buyer_username: str) -> int | None:
